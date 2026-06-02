@@ -1,6 +1,6 @@
 # benchq - Benchmark Results: cascadeq vs go-dsqueue
 
-Some LLM-generated benchmarks to compare cascadeq and go-dsqueue persistent queues.
+Some LLM-generated benchmarks to compare [`cascadeq`](https://github.com/gammazero/cascadeq) and [`go-dsqueue`](https://github.com/ipfs/go-dsqueue) persistent queues.
 
 ## Environment
 
