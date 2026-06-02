@@ -2,7 +2,7 @@
 
 Some LLM-generated benchmarks to compare [`cascadeq`](https://github.com/gammazero/cascadeq) and [`go-dsqueue`](https://github.com/ipfs/go-dsqueue) persistent queues.
 
-> Note: the configuration below deliberately forces nearly every item through the backing store, which maximises the contrast but is not how `go-dsqueue` is actually driven by its main consumer (boxo's provide queue). For results using boxo's real configuration, see [Production configuration (how kubo uses dsqueue)](#production-configuration-how-kubo-uses-dsqueue) below.
+> Note: the configuration below deliberately forces nearly every item through the backing store, which maximises the contrast but is not how `go-dsqueue` is actually driven by its main consumer (kubo's provide queue). For results using kubo's real configuration, see [Production configuration (how kubo uses dsqueue)](#production-configuration-how-kubo-uses-dsqueue) below.
 
 ## Environment
 
@@ -83,21 +83,35 @@ an `fsync` on each delete, resulting in ~7–10 ms of latency per item on macOS
 
 ## Production configuration (how kubo uses dsqueue)
 
-The configuration above forces almost every item through the backing store with a
-4-item dsqueue buffer and no dedup, which maximises the contrast but is not how boxo
-drives the queue. boxo's `provider/reprovider.go` constructs it as:
+The config above forces almost every item to disk with a 4-item buffer and no dedup. That
+is not how `go-dsqueue` is used. Its main consumer is kubo's provide queue, which has two
+paths:
 
-```go
-dsqueue.New(ds, "provide", dsqueue.WithDedupCacheSize(2048))
-```
+- **Default** (`Provide.DHT.SweepEnabled=true`): the `go-libp2p-kad-dht` buffered
+  `SweepingProvider`. dsqueue at `/provider/bprov`, drained with `GetN(1024)`
+  (`buffered.DefaultBatchSize`), dedup off.
+- **Legacy** (`Provide.DHT.SweepEnabled=false`, or HTTP-only routing): boxo's
+  `provider/reprovider.go`. dsqueue at `/provider/dsq-provide`, drained item-by-item via
+  `Out()`, dedup 2048.
 
-That is the default 16K input buffer plus a 2048-entry dedup cache, on the repo's root
-datastore. In kubo that root datastore is **LevelDB by default**, or Pebble/Badger when
-the matching init profile is used. LevelDB writes are synchronous (`syncWrites=true`, an
-`fsync` per `Put`/`Delete`); Pebble uses `pebble.NoSync` (no per-write `fsync`); the kubo
-plugins do not override either. The benchmarks in `prod_bench_test.go` use that config,
-add Pebble alongside LevelDB, and add the scenario the provide queue actually hits:
-draining a large persisted backlog after a restart.
+Both keep the default 16K buffer. The root datastore is **LevelDB by default**, or
+Pebble/Badger via init profile. LevelDB fsyncs every write (`syncWrites=true`), Pebble
+does not (`pebble.NoSync`); the kubo plugins keep these defaults.
+
+**The headline changes once the config is real.** At kubo's default (`GetN(1024)`)
+cascadeq is about 5 to 8x faster, not the 100 to 1000x the forced-to-disk config shows.
+The huge gap is only the legacy `Out()` path. Per-item cost draining a 20k backlog after a
+restart:
+
+| drain path (20k backlog) | per item | cascadeq faster |
+|---|---|---|
+| cascadeq | 0.9 µs | baseline |
+| `GetN(16384)` Pebble | 2.2 µs | ~2x |
+| `GetN(16384)` LevelDB | 3.1 µs | ~3x |
+| `GetN(1024)` Pebble (default) | 4.7 µs | ~5x |
+| `GetN(1024)` LevelDB (default) | 6.8 µs | ~8x |
+| `Out()` Pebble (legacy) | 1.26 ms | ~1400x |
+| `Out()` LevelDB (legacy) | 2.6 ms | ~2900x |
 
 ### Environment
 
@@ -110,42 +124,37 @@ draining a large persisted backlog after a restart.
 | go-ds-leveldb | v0.5.2 |
 | go-ds-pebble | v0.5.11 |
 
-### Restart with a persisted backlog
+### Why Out() is slow
 
-A node restarts (or a burst of adds overflows the buffer), leaving a backlog in the
-backing store that is then drained. boxo drains item-by-item via `Out()`. `go-dsqueue`
-also ships `GetN(n)`, which issues one ordered query and one batched delete per call.
+`Out()` re-runs `Query{Limit:1}` and deletes from the front for every item, so each read
+scans past a growing run of tombstones that compaction has not cleared yet. This is not
+the `OrderByKey` query (every sorted KV backend serves that from its native iterator); it
+is tombstone buildup from per-item deletes, and Pebble hits it too:
 
-Per-item cost draining a 20k backlog:
+| backlog | `Out()` Pebble | `GetN(1024)` Pebble | `GetN(16384)` Pebble | cascadeq |
+|---|---|---|---|---|
+| 5k | 199 µs | 2.1 µs | 2.3 µs | 0.6 µs |
+| 20k | 1265 µs | 4.7 µs | 2.2 µs | 0.9 µs |
+| 40k | 1678 µs | 6.2 µs | 2.6 µs | 0.7 µs |
 
-| drain method | LevelDB | Pebble | cascadeq |
-|---|---|---|---|
-| `Out()` (item-by-item, what boxo does today) | 2.6 ms | 1.26 ms | n/a |
-| `GetN(16384)` (batched) | 3.1 µs | 2.2 µs | n/a |
-| cascadeq `Out()` | n/a | n/a | 0.9 µs |
+`GetN` spreads the tombstone scan over the batch. The default 1024 keeps the cost in
+microseconds but it still creeps up with backlog. A bigger batch (16384) keeps it flat.
+cascadeq has no tombstones: it reads items back in order from its own files.
 
-The `Out()` path gets slower as the backlog grows, because `go-dsqueue` re-issues a
-`Query{Limit:1}` and point-deletes from the front for every item, so each head read
-scans past an ever-growing run of not-yet-compacted tombstones. This is not the
-`OrderByKey` query (every sorted KV backend serves that from its native iterator); it is
-tombstone accumulation under per-item front deletion, and it affects Pebble too:
+### Related: the keystore already hit this
 
-| backlog | `Out()` Pebble | `GetN(16384)` Pebble | cascadeq |
-|---|---|---|---|
-| 5k | 199 µs | 2.3 µs | 0.6 µs |
-| 10k | 881 µs | 1.5 µs | n/a |
-| 20k | 1265 µs | 2.2 µs | 0.9 µs |
-| 40k | 1678 µs | 2.6 µs | 0.7 µs |
-
-Draining via `GetN` amortises the tombstone scan over the batch, flattening the cost to a
-few microseconds per item regardless of backlog size (~600 to 1000x faster than per-item
-`Out()`) and staying within ~3-4x of cascadeq. cascadeq avoids the tombstones entirely by
-reading items back in order from its own sequential files.
+The same tombstone cost was already fixed for the DHT provider *keystore* (the multihashes
+scheduled for reproviding), a separate datastore from the queue. Each reset deleted every
+key one by one, leaving tombstones that grew the datastore until compaction
+(`ipfs/kubo#11096`). The fix (`libp2p/go-libp2p-kad-dht#1233`, `ipfs/kubo#11198`) gives the
+keystore its own datastore per reset and drops the whole directory with `os.RemoveAll`
+instead of per-key deletes. Different component, same root cause: mass point-deletes on an
+LSM.
 
 ### Steady state
 
-When the queue stays shallow (it drains about as fast as it fills) items never reach
-disk, and all three are within ~1.5x of each other:
+When the queue stays shallow (it drains about as fast as it fills) nothing reaches disk,
+and all three are within ~1.5x:
 
 | cascadeq | dsqueue LevelDB | dsqueue Pebble |
 |---|---|---|
@@ -153,9 +162,10 @@ disk, and all three are within ~1.5x of each other:
 
 ### Takeaway
 
-At the forced-to-disk config the gap looks like ~100 to 1000x, but most of that is the
-per-item `fsync` on LevelDB plus the 4-item buffer. At boxo's config the only place
-`go-dsqueue` is genuinely slow is draining a large persisted backlog item-by-item, and
-that is fixable in place by draining via `GetN` instead of `Out()`, with no library change
-and the queue staying inside the pluggable datastore. cascadeq remains modestly faster and
-allocates less, but at boxo's config the difference is microseconds, not milliseconds.
+The ~100 to 1000x headline is the legacy `Out()` path at a worst-case config. At kubo's
+default the queue drains in batches via `GetN`, so cascadeq is only ~5 to 8x faster and
+both sit in the microseconds. The one slow spot left is the legacy boxo provider on a
+large backlog (milliseconds per item, growing with size); it is fixable in place by
+switching it to `GetN`, no library change and the queue stays in the pluggable datastore.
+cascadeq is still a bit faster and allocates less, but at the batch sizes kubo uses the gap
+is microseconds, not milliseconds.

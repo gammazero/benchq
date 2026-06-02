@@ -186,6 +186,18 @@ func BenchmarkRestartDrainGetN_DSQueue_Pebble(b *testing.B) {
 	benchDSQueueRestartDrainGetN(b, newPebble, 16*1024)
 }
 
+// batch=1024 matches the kad-dht buffered SweepingProvider default
+// (buffered.DefaultBatchSize), which is the drain path kubo uses by default
+// (Provide.DHT.SweepEnabled=true).
+
+func BenchmarkRestartDrainGetN1k_DSQueue_LevelDB(b *testing.B) {
+	benchDSQueueRestartDrainGetN(b, newLevelDB, 1024)
+}
+
+func BenchmarkRestartDrainGetN1k_DSQueue_Pebble(b *testing.B) {
+	benchDSQueueRestartDrainGetN(b, newPebble, 1024)
+}
+
 // ── Scenario B: steady-state put+get at production config ─────────────────────
 //
 // Producer enqueues b.N items while a background goroutine drains. At the
