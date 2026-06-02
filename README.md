@@ -2,6 +2,8 @@
 
 Some LLM-generated benchmarks to compare [`cascadeq`](https://github.com/gammazero/cascadeq) and [`go-dsqueue`](https://github.com/ipfs/go-dsqueue) persistent queues.
 
+> Note: the configuration below deliberately forces nearly every item through the backing store, which maximises the contrast but is not how `go-dsqueue` is actually driven by its main consumer (boxo's provide queue). For results using boxo's real configuration, see [Production configuration (how kubo uses dsqueue)](#production-configuration-how-kubo-uses-dsqueue) below.
+
 ## Environment
 
 | | |
@@ -78,3 +80,82 @@ base64-encoded into the key itself; the value is empty). Dequeuing via
 settings the `go-ds-leveldb` / `syndtr/goleveldb` write path appears to issue
 an `fsync` on each delete, resulting in ~7–10 ms of latency per item on macOS
 — consistent with the ~5–15 ms cost of a synchronous `fsync` on Apple SSDs.
+
+## Production configuration (how kubo uses dsqueue)
+
+The configuration above forces almost every item through the backing store with a
+4-item dsqueue buffer and no dedup, which maximises the contrast but is not how boxo
+drives the queue. boxo's `provider/reprovider.go` constructs it as:
+
+```go
+dsqueue.New(ds, "provide", dsqueue.WithDedupCacheSize(2048))
+```
+
+That is the default 16K input buffer plus a 2048-entry dedup cache, on the repo's root
+datastore. In kubo that root datastore is **LevelDB by default**, or Pebble/Badger when
+the matching init profile is used. LevelDB writes are synchronous (`syncWrites=true`, an
+`fsync` per `Put`/`Delete`); Pebble uses `pebble.NoSync` (no per-write `fsync`); the kubo
+plugins do not override either. The benchmarks in `prod_bench_test.go` use that config,
+add Pebble alongside LevelDB, and add the scenario the provide queue actually hits:
+draining a large persisted backlog after a restart.
+
+### Environment
+
+| | |
+|---|---|
+| Machine | 32-core x86_64 Linux, NVMe SSD |
+| Go | 1.26.3 |
+| cascadeq | v0.0.2 |
+| go-dsqueue | v0.2.0 |
+| go-ds-leveldb | v0.5.2 |
+| go-ds-pebble | v0.5.11 |
+
+### Restart with a persisted backlog
+
+A node restarts (or a burst of adds overflows the buffer), leaving a backlog in the
+backing store that is then drained. boxo drains item-by-item via `Out()`. `go-dsqueue`
+also ships `GetN(n)`, which issues one ordered query and one batched delete per call.
+
+Per-item cost draining a 20k backlog:
+
+| drain method | LevelDB | Pebble | cascadeq |
+|---|---|---|---|
+| `Out()` (item-by-item, what boxo does today) | 2.6 ms | 1.26 ms | n/a |
+| `GetN(16384)` (batched) | 3.1 µs | 2.2 µs | n/a |
+| cascadeq `Out()` | n/a | n/a | 0.9 µs |
+
+The `Out()` path gets slower as the backlog grows, because `go-dsqueue` re-issues a
+`Query{Limit:1}` and point-deletes from the front for every item, so each head read
+scans past an ever-growing run of not-yet-compacted tombstones. This is not the
+`OrderByKey` query (every sorted KV backend serves that from its native iterator); it is
+tombstone accumulation under per-item front deletion, and it affects Pebble too:
+
+| backlog | `Out()` Pebble | `GetN(16384)` Pebble | cascadeq |
+|---|---|---|---|
+| 5k | 199 µs | 2.3 µs | 0.6 µs |
+| 10k | 881 µs | 1.5 µs | n/a |
+| 20k | 1265 µs | 2.2 µs | 0.9 µs |
+| 40k | 1678 µs | 2.6 µs | 0.7 µs |
+
+Draining via `GetN` amortises the tombstone scan over the batch, flattening the cost to a
+few microseconds per item regardless of backlog size (~600 to 1000x faster than per-item
+`Out()`) and staying within ~3-4x of cascadeq. cascadeq avoids the tombstones entirely by
+reading items back in order from its own sequential files.
+
+### Steady state
+
+When the queue stays shallow (it drains about as fast as it fills) items never reach
+disk, and all three are within ~1.5x of each other:
+
+| cascadeq | dsqueue LevelDB | dsqueue Pebble |
+|---|---|---|
+| 2.2 µs | 3.2 µs | 3.0 µs |
+
+### Takeaway
+
+At the forced-to-disk config the gap looks like ~100 to 1000x, but most of that is the
+per-item `fsync` on LevelDB plus the 4-item buffer. At boxo's config the only place
+`go-dsqueue` is genuinely slow is draining a large persisted backlog item-by-item, and
+that is fixable in place by draining via `GetN` instead of `Out()`, with no library change
+and the queue staying inside the pluggable datastore. cascadeq remains modestly faster and
+allocates less, but at boxo's config the difference is microseconds, not milliseconds.
