@@ -2,6 +2,8 @@
 
 Some LLM-generated benchmarks to compare [`cascadeq`](https://github.com/gammazero/cascadeq) and [`go-dsqueue`](https://github.com/ipfs/go-dsqueue) persistent queues.
 
+> Note: the configuration below deliberately forces nearly every item through the backing store, which maximises the contrast but is not how `go-dsqueue` is actually driven by its main consumer (kubo's provide queue). For results using kubo's real configuration, see [Production configuration (how kubo uses dsqueue)](#production-configuration-how-kubo-uses-dsqueue) below.
+
 ## Environment
 
 | | |
@@ -78,3 +80,92 @@ base64-encoded into the key itself; the value is empty). Dequeuing via
 settings the `go-ds-leveldb` / `syndtr/goleveldb` write path appears to issue
 an `fsync` on each delete, resulting in ~7–10 ms of latency per item on macOS
 — consistent with the ~5–15 ms cost of a synchronous `fsync` on Apple SSDs.
+
+## Production configuration (how kubo uses dsqueue)
+
+The config above forces almost every item to disk with a 4-item buffer and no dedup. That
+is not how `go-dsqueue` is used. Its main consumer is kubo's provide queue, which has two
+paths:
+
+- **Default** (`Provide.DHT.SweepEnabled=true`): the `go-libp2p-kad-dht` buffered
+  `SweepingProvider`. dsqueue at `/provider/bprov`, drained with `GetN(1024)`
+  (`buffered.DefaultBatchSize`), dedup off.
+- **Legacy** (`Provide.DHT.SweepEnabled=false`, or HTTP-only routing): boxo's
+  `provider/reprovider.go`. dsqueue at `/provider/dsq-provide`, drained item-by-item via
+  `Out()`, dedup 2048.
+
+Both keep the default 16K buffer. The root datastore is **LevelDB by default**, or
+Pebble/Badger via init profile. LevelDB fsyncs every write (`syncWrites=true`), Pebble
+does not (`pebble.NoSync`); the kubo plugins keep these defaults.
+
+**The headline changes once the config is real.** At kubo's default (`GetN(1024)`)
+cascadeq is about 5 to 8x faster, not the 100 to 1000x the forced-to-disk config shows.
+The huge gap is only the legacy `Out()` path. Per-item cost draining a 20k backlog after a
+restart:
+
+| drain path (20k backlog) | per item | cascadeq faster |
+|---|---|---|
+| cascadeq | 0.9 µs | baseline |
+| `GetN(16384)` Pebble | 2.2 µs | ~2x |
+| `GetN(16384)` LevelDB | 3.1 µs | ~3x |
+| `GetN(1024)` Pebble (default) | 4.7 µs | ~5x |
+| `GetN(1024)` LevelDB (default) | 6.8 µs | ~8x |
+| `Out()` Pebble (legacy) | 1.26 ms | ~1400x |
+| `Out()` LevelDB (legacy) | 2.6 ms | ~2900x |
+
+### Environment
+
+| | |
+|---|---|
+| Machine | 32-core x86_64 Linux, NVMe SSD |
+| Go | 1.26.3 |
+| cascadeq | v0.0.2 |
+| go-dsqueue | v0.2.0 |
+| go-ds-leveldb | v0.5.2 |
+| go-ds-pebble | v0.5.11 |
+
+### Why Out() is slow
+
+`Out()` re-runs `Query{Limit:1}` and deletes from the front for every item, so each read
+scans past a growing run of tombstones that compaction has not cleared yet. This is not
+the `OrderByKey` query (every sorted KV backend serves that from its native iterator); it
+is tombstone buildup from per-item deletes, and Pebble hits it too:
+
+| backlog | `Out()` Pebble | `GetN(1024)` Pebble | `GetN(16384)` Pebble | cascadeq |
+|---|---|---|---|---|
+| 5k | 199 µs | 2.1 µs | 2.3 µs | 0.6 µs |
+| 20k | 1265 µs | 4.7 µs | 2.2 µs | 0.9 µs |
+| 40k | 1678 µs | 6.2 µs | 2.6 µs | 0.7 µs |
+
+`GetN` spreads the tombstone scan over the batch. The default 1024 keeps the cost in
+microseconds but it still creeps up with backlog. A bigger batch (16384) keeps it flat.
+cascadeq has no tombstones: it reads items back in order from its own files.
+
+### Related: the keystore already hit this
+
+The same tombstone cost was already fixed for the DHT provider *keystore* (the multihashes
+scheduled for reproviding), a separate datastore from the queue. Each reset deleted every
+key one by one, leaving tombstones that grew the datastore until compaction
+(`ipfs/kubo#11096`). The fix (`libp2p/go-libp2p-kad-dht#1233`, `ipfs/kubo#11198`) gives the
+keystore its own datastore per reset and drops the whole directory with `os.RemoveAll`
+instead of per-key deletes. Different component, same root cause: mass point-deletes on an
+LSM.
+
+### Steady state
+
+When the queue stays shallow (it drains about as fast as it fills) nothing reaches disk,
+and all three are within ~1.5x:
+
+| cascadeq | dsqueue LevelDB | dsqueue Pebble |
+|---|---|---|
+| 2.2 µs | 3.2 µs | 3.0 µs |
+
+### Takeaway
+
+The ~100 to 1000x headline is the legacy `Out()` path at a worst-case config. At kubo's
+default the queue drains in batches via `GetN`, so cascadeq is only ~5 to 8x faster and
+both sit in the microseconds. The one slow spot left is the legacy boxo provider on a
+large backlog (milliseconds per item, growing with size); it is fixable in place by
+switching it to `GetN`, no library change and the queue stays in the pluggable datastore.
+cascadeq is still a bit faster and allocates less, but at the batch sizes kubo uses the gap
+is microseconds, not milliseconds.
